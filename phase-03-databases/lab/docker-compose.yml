@@ -1,0 +1,134 @@
+# =============================================================================
+#  PHASE 3A / 3B LAB — indexing and transaction isolation
+# =============================================================================
+#
+#  ⚠️ PHASE 3 HAS THREE SEPARATE COMPOSE FILES. They're deliberately isolated
+#     so one lab's containers/ports can't interfere with another's:
+#
+#       docker-compose.yml              <- THIS FILE. 3A indexing + 3B write skew.
+#       docker-compose.replication.yml  <- 3C primary + replica, failover
+#       docker-compose.cassandra.yml    <- 3F 3-node Cassandra
+#
+#     A plain `docker compose up` uses THIS file. The others need -f:
+#       docker compose -f docker-compose.replication.yml up -d
+#
+#  ---------------------------------------------------------------------------
+#  WHAT THIS BUILDS
+#
+#      postgres  <-- lab (one-shot scripts)
+#
+#  WHAT YOU LEARN
+#    Lab A (indexing)   -- the SAME query run six ways over 10M rows.
+#                          Column ORDER alone is 4.7x. A covering index is 302x.
+#                          And an index you built can be IGNORED by the planner.
+#    Lab B (write skew) -- reproduce the on-call-doctors anomaly, then fix it
+#                          three ways -- and discover that a UNIQUE constraint
+#                          can only fix it when the conflict is MATERIALISABLE.
+#
+#  ---------------------------------------------------------------------------
+#  HOW TO RUN — in this order
+#  ---------------------------------------------------------------------------
+#
+#    # 1. start Postgres
+#    docker compose up -d
+#    docker compose ps                 # wait for (healthy)
+#
+#    # 2. LAB A -- seed 10M rows (~25s, ~1GB), then benchmark
+#    docker compose run --rm lab node lab-a-indexing/seed.js
+#    docker compose run --rm lab node lab-a-indexing/bench.js
+#
+#    # 3. LAB B -- write skew (fast, no seeding needed)
+#    docker compose run --rm lab node lab-b-write-skew/run.js
+#
+#    # 4. explore by hand (note port 5434):
+#    psql postgresql://lab:lab@localhost:5434/lab
+#    #   \d events                     -- see the table
+#    #   EXPLAIN ANALYZE SELECT ...    -- read plans yourself
+#
+#    # 5. clean up  (-v deletes the 10M-row volume too)
+#    docker compose down -v
+#
+#  See ./README.md for expected numbers, ../../DOCKER-GUIDE.md for Docker help.
+# =============================================================================
+
+services:
+
+  postgres:
+    image: postgres:17-alpine
+    container_name: p3-postgres
+
+    environment:
+      POSTGRES_USER: lab
+      POSTGRES_PASSWORD: lab
+      POSTGRES_DB: lab
+
+    ports:
+      # ⚠️ 5434 on the host. 5432 is taken by your pgvector container and 5433
+      #    by the Phase 1 lab. Inside the compose network it's still 5432.
+      - "5434:5432"
+
+    # ⚠️ NOTE: `command: >` is a YAML FOLDED SCALAR -- everything indented under
+    #    it is LITERAL TEXT. A `#` in there is NOT a comment; it becomes part of
+    #    the command and Docker fails with "invalid command line string".
+    #    So the explanations live here, above the block:
+    #
+    #      shared_buffers=512MB   Postgres' own page cache. Big enough that we
+    #                             measure INDEX STRATEGY, not disk thrashing.
+    #      work_mem=32MB          memory per sort/hash operation. Too small and
+    #                             sorts spill to disk ("external merge Disk:" in
+    #                             EXPLAIN), which muddies the comparison.
+    #      max_wal_size=4GB       lets the 10M-row bulk insert run without
+    #                             constant checkpoints.
+    #  ⭐  random_page_cost=1.1    TELLS THE PLANNER WE'RE ON SSD. The default
+    #                             (4.0) assumes spinning disks, makes index scans
+    #                             look expensive, and pushes the planner toward
+    #                             sequential scans. Getting this wrong changes
+    #                             which plans you see in the lab.
+    #      track_io_timing=on     enables I/O timings in EXPLAIN (BUFFERS).
+    command: >
+      postgres
+      -c shared_buffers=512MB
+      -c work_mem=32MB
+      -c max_wal_size=4GB
+      -c random_page_cost=1.1
+      -c track_io_timing=on
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lab -d lab"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ---------------------------------------------------------------------------
+  # The scripts container. No server -- you invoke one script per run.
+  # ---------------------------------------------------------------------------
+  lab:
+    build: .                  # uses ./Dockerfile (installs the `pg` driver)
+    container_name: p3-lab
+    profiles: ["tools"]       # ⚠️ NOT started by `up`. Run explicitly:
+                              #      docker compose run --rm lab node <script>
+                              #    and if you add a dependency:
+                              #      docker compose build lab
+
+    environment:
+      PGHOST: postgres        # ⭐ the service name = the hostname
+      PGUSER: lab
+      PGPASSWORD: lab
+      PGDATABASE: lab
+      ROWS: "10000000"        # 10M. Try ROWS=1000000 for a faster (less
+                              # dramatic) run, or 50000000 if you have the disk.
+
+    volumes:
+      # Mount the script directories so you can EDIT and re-run without
+      # rebuilding the image.
+      #
+      # ⚠️ Note we mount SUBDIRECTORIES (/srv/lab-a-indexing), not /srv itself.
+      #    Mounting over /srv would hide the node_modules the image installed
+      #    there -- see DOCKER-GUIDE.md Gotcha 2.
+      - ./lab-a-indexing:/srv/lab-a-indexing:ro
+      - ./lab-b-write-skew:/srv/lab-b-write-skew:ro
+      - ./db.js:/srv/db.js:ro
+
+    depends_on:
+      postgres:
+        condition: service_healthy

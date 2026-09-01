@@ -1,0 +1,10 @@
+{
+  "name": "phase06-messaging-lab",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Kafka partitions, consumer groups, duplicate delivery, idempotent consumers and the outbox pattern.",
+  "dependencies": {
+    "kafkajs": "^2.2.4",
+    "pg": "^8.13.1"
+  }
+}

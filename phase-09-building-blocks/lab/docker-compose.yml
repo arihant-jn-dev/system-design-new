@@ -1,0 +1,142 @@
+# =============================================================================
+#  PHASE 9 LAB — reusable building blocks
+# =============================================================================
+#
+#  ⚠️ THREE OF THE FOUR PARTS NEED NO DOCKER AT ALL.
+#
+#     The bloom filter, the Snowflake generator and the autocomplete trie are
+#     pure algorithms with ZERO dependencies. Run them with plain node:
+#
+#         node bloom-filter/run.js
+#         node snowflake/run.js
+#         node autocomplete/run.js
+#
+#     That is deliberate: the roadmap says "implement three of these from
+#     scratch... ~150 lines each, and they'll stick permanently." Wrapping them
+#     in infrastructure would obscure the point.
+#
+#  ---------------------------------------------------------------------------
+#  SO WHAT IS THIS FILE FOR?
+#
+#  Part D -- the ONE claim in this phase you cannot prove with an algorithm,
+#  because it is about how a REAL B-TREE behaves on disk:
+#
+#      ⭐ "UUID v4 destroys B-tree locality; UUID v7 / Snowflake don't."
+#
+#  We insert the SAME number of rows into three tables whose only difference is
+#  the primary key type, and measure INDEX SIZE, INSERT TIME and WAL WRITTEN.
+#
+#      postgres  <-- lab (a one-shot script)
+#
+#  WHAT YOU LEARN
+#    · ⭐ random keys cause PAGE SPLITS: every insert lands on a different page,
+#      each split leaves two half-full pages, and the index ends up much larger
+#      for exactly the same data
+#    · ⭐ they also generate far more WAL, because a dirtied page must be
+#      written in full the first time it is touched after a checkpoint
+#    · ⭐ time-ordered keys always append to the RIGHT-MOST leaf, which stays hot
+#      in cache -- so inserts are faster AND the index is denser
+#
+#  ---------------------------------------------------------------------------
+#  HOW TO RUN — in this order
+#  ---------------------------------------------------------------------------
+#
+#    # 1. the three no-Docker parts first (fast, and they're the actual lab)
+#    node bloom-filter/run.js
+#    node snowflake/run.js
+#    node autocomplete/run.js
+#
+#    # 2. start Postgres for Part D
+#    docker compose up -d
+#    docker compose ps                    # wait for (healthy)
+#
+#    # 3. ⚠️ build the tools image explicitly -- profile'd services are SKIPPED
+#    #    by `up --build` (see ../../DOCKER-GUIDE.md Gotcha 1)
+#    docker compose build lab
+#
+#    # 4. run the locality benchmark (~2-4 min; inserts 3 x 1M rows)
+#    docker compose run --rm lab node id-locality/run.js
+#
+#    # 5. look at it yourself (note port 5441):
+#    psql postgresql://lab:lab@localhost:5441/lab
+#    #   \di+                                    -- the three indexes and sizes
+#    #   SELECT * FROM pgstatindex('t_uuid_v4_pkey');   -- ⭐ avg_leaf_density!
+#    #   SELECT * FROM pgstatindex('t_uuid_v7_pkey');
+#
+#    # 6. clean up
+#    docker compose down -v
+#
+#  See ./README.md for expected numbers.
+# =============================================================================
+
+services:
+
+  postgres:
+    image: postgres:17-alpine
+    container_name: p9-postgres
+
+    environment:
+      POSTGRES_USER: lab
+      POSTGRES_PASSWORD: lab
+      POSTGRES_DB: lab
+      POSTGRES_HOST_AUTH_METHOD: trust    # lab only -- no password prompts
+
+    # ⚠️ `command: >` is a YAML FOLDED SCALAR: everything under it is LITERAL
+    #    TEXT, so a `#` in there is NOT a comment and Docker fails with
+    #    "invalid command line string". Explanations therefore live up here:
+    #
+    #  ⭐  shared_buffers=16MB   DELIBERATELY MUCH SMALLER THAN THE INDEXES WE
+    #                           BUILD (~75MB each at ROWS=2000000).
+    #                           That is the experiment: with random keys the
+    #                           working set is the WHOLE index and it cannot fit,
+    #                           so pages are evicted and re-read constantly. With
+    #                           time-ordered keys the working set is ONE page --
+    #                           the right-most leaf -- which always stays cached.
+    #                           Give this 2GB and the difference shrinks, because
+    #                           you have papered over the locality problem with
+    #                           memory. (Try it -- that's a useful experiment.)
+    #
+    #      max_wal_size=8GB     keeps checkpoints from dominating the timings.
+    #      checkpoint_timeout=30min  same reason -- we want to measure inserts,
+    #                           not checkpoint scheduling.
+    #      random_page_cost=1.1 tells the planner we're on SSD (Phase 3).
+    #      track_io_timing=on   enables I/O timings in EXPLAIN (BUFFERS).
+    command: >
+      postgres
+      -c shared_buffers=16MB
+      -c max_wal_size=8GB
+      -c checkpoint_timeout=30min
+      -c random_page_cost=1.1
+      -c track_io_timing=on
+
+    ports:
+      - "5441:5432"     # ⚠️ 5441 -- every phase gets its own host port so labs
+                        #    can run side by side (5432 is your pgvector container)
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lab -d lab"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+
+  lab:
+    build: .
+    container_name: p9-lab
+    profiles: ["tools"]      # ⚠️ build explicitly: docker compose build lab
+
+    environment:
+      PGHOST: postgres
+      PGUSER: lab
+      PGPASSWORD: lab
+      PGDATABASE: lab
+      ROWS: "2000000"        # the index must comfortably EXCEED shared_buffers
+                             # or the effect cannot appear at all -- see README
+
+    volumes:
+      # Subdirectory only -- mounting /srv would hide node_modules
+      # (DOCKER-GUIDE.md Gotcha 2)
+      - ./id-locality:/srv/id-locality:ro
+
+    depends_on:
+      postgres:
+        condition: service_healthy

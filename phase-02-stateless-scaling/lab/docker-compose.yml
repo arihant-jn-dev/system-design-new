@@ -1,0 +1,167 @@
+# =============================================================================
+#  PHASE 2 LAB — load balancing, health checks and failure modes
+# =============================================================================
+#
+#  WHAT THIS BUILDS
+#
+#      k6 ──▶ nginx ──┬──▶ app1  ┐
+#                     ├──▶ app2  ├─ three IDENTICAL stateless replicas
+#                     └──▶ app3  ┘
+#
+#  THE POINT: the roadmap says "kill one mid-load-test and watch the error
+#  rate" -- and doing that produces a SURPRISE (barely any errors, because
+#  nginx silently retries). So this lab breaks a replica THREE different ways,
+#  because "a backend failed" is not one failure mode:
+#
+#      crash  (docker kill)   -> connection refused  -> instantly detectable
+#      errors (HTTP 500)      -> a valid response    -> ⚠️ nginx does NOT
+#                                                        consider this a failure
+#      hang   (no response)   -> ...nothing          -> ⭐ THE GRAY FAILURE
+#
+#  ⭐ The hang is the important one: 0% errors, unchanged median, GREEN health
+#     check -- and a p99 143x worse. Every dashboard looks fine.
+#
+#  ---------------------------------------------------------------------------
+#  HOW TO RUN — in this order
+#  ---------------------------------------------------------------------------
+#
+#    # 1. start nginx + 3 replicas
+#    docker compose up -d
+#    docker compose ps                      # all 3 apps (healthy), nginx Up
+#    curl localhost:8080/api/work           # note which instance answers
+#
+#    # 2. A1 -- baseline. Should be a near-perfect round-robin split.
+#    docker compose run --rm k6 run -e RPS=200 -e DURATION=20s /scripts/load.js
+#
+#    # 3. A2 -- CRASH a replica mid-test (the surprise: ~0 errors)
+#    ( sleep 8; docker kill lab-app2-1 ) &
+#    docker compose run --rm k6 run -e RPS=200 -e DURATION=25s /scripts/load.js
+#    docker compose up -d app2              # bring it back
+#
+#    # 4. A3 -- make it return 500s instead (errors ARE visible)
+#    ( sleep 8; curl -XPOST localhost:8082/admin/mode -d '{"mode":"error"}' ) &
+#    docker compose run --rm k6 run -e RPS=200 -e DURATION=25s /scripts/load.js
+#    curl -XPOST localhost:8082/admin/mode -d '{"mode":"healthy"}'
+#
+#    # 5. A4 -- ⭐ make it HANG. Watch p99, not the error rate.
+#    ( sleep 8; curl -XPOST localhost:8082/admin/mode -d '{"mode":"hang"}' ) &
+#    docker compose run --rm k6 run -e RPS=200 -e DURATION=25s /scripts/load.js
+#    curl localhost:8082/health             # ⭐ still says {"ok":true} while hanging!
+#    curl -XPOST localhost:8082/admin/mode -d '{"mode":"healthy"}'
+#
+#    # 6. PART B needs no Docker at all -- plain Node, no dependencies:
+#    node part-b-consistent-hashing/hashing.js
+#
+#    # 7. clean up
+#    docker compose down
+#
+#  See ./README.md for expected numbers, ../../DOCKER-GUIDE.md for Docker help.
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # THREE IDENTICAL REPLICAS.
+  #
+  # ⭐ `&app` defines a YAML ANCHOR -- a reusable block. app2 and app3 pull it
+  #    in with `<<: *app` and override only what differs. Pure YAML, nothing
+  #    Docker-specific: it just avoids copy-pasting the same config 3 times.
+  # ---------------------------------------------------------------------------
+  app1: &app
+    image: node:24-alpine
+    working_dir: /srv
+    volumes:
+      - ./part-a-load-balancing/app:/srv:ro   # all three mount the SAME code --
+                                              # that's what makes them identical
+    command: node server.js
+
+    environment:
+      INSTANCE_ID: app1     # so responses carry x-instance and you can see
+                            # which replica served each request
+      PORT: "8080"
+      DRAIN_MS: "3000"      # ⭐ graceful shutdown: on SIGTERM, FAIL the health
+                            #    check, WAIT this long for the LB to notice,
+                            #    THEN stop accepting connections.
+                            #    Removing that wait is what causes "502s on
+                            #    every deploy". Try DRAIN_MS=0 and compare.
+
+    ports:
+      # ⭐ Each replica is ALSO published directly (8081/8082/8083) so you can
+      #    inject failures into ONE of them without going through nginx.
+      #    In production you would never expose these.
+      - "8081:8080"
+
+    healthcheck:
+      # ⭐ Deliberately SHALLOW -- it reports on THIS process only and does NOT
+      #    check any shared dependency.
+      #
+      #    That's the correct design (a DEEP health check that hits a shared
+      #    database makes every instance fail SIMULTANEOUSLY when the database
+      #    hiccups, and the LB removes your entire fleet -- see notes/05).
+      #
+      #    It also means it PASSES while mode=hang. That is not a bug in the
+      #    lab: a shallow check cannot detect slowness. That IS the gray failure.
+      test: ["CMD", "node", "-e", "fetch('http://localhost:8080/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  app2:
+    <<: *app                 # inherit everything from app1...
+    environment:             # ...then override (note: this REPLACES the whole
+      INSTANCE_ID: app2      # environment block, so all keys must be repeated)
+      PORT: "8080"
+      DRAIN_MS: "3000"
+    ports:
+      - "8082:8080"
+
+  app3:
+    <<: *app
+    environment:
+      INSTANCE_ID: app3
+      PORT: "8080"
+      DRAIN_MS: "3000"
+    ports:
+      - "8083:8080"
+
+  # ---------------------------------------------------------------------------
+  # The load balancer.
+  # ---------------------------------------------------------------------------
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: p2-nginx
+
+    volumes:
+      # ⭐ Mounting a SINGLE FILE (not a directory). Read nginx.conf itself --
+      #    its comments explain the LB config, and the config IS the lesson.
+      #
+      # ⚠️ GOTCHA: editing a bind-mounted single file with `sed -i` or many
+      #    editors REPLACES the file (new inode), and the container may keep
+      #    seeing the old one. After editing:
+      #        docker compose up -d --force-recreate nginx
+      #    (`nginx -s reload` alone is not enough -- see DOCKER-GUIDE.md Gotcha 3)
+      - ./part-a-load-balancing/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+
+    ports:
+      - "8080:80"           # nginx listens on 80 inside; you reach it on 8080
+
+    depends_on:
+      # Wait for ALL three to be healthy before starting nginx. Otherwise nginx
+      # starts, finds no upstreams, and marks them all down.
+      app1:
+        condition: service_healthy
+      app2:
+        condition: service_healthy
+      app3:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # Load generator.
+  # ---------------------------------------------------------------------------
+  k6:
+    image: grafana/k6:latest
+    profiles: ["tools"]      # ⚠️ not started by `up` -- run it explicitly
+    volumes:
+      - ./k6:/scripts:ro
+    depends_on:
+      - nginx

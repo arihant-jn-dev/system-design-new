@@ -1,0 +1,168 @@
+# =============================================================================
+#  PHASE 0 LAB — measuring latency, percentiles and tail amplification
+# =============================================================================
+#
+#  WHAT THIS BUILDS
+#
+#      k6 (load generator) ──▶ app ──▶ dependency
+#
+#    · dependency  a fake downstream service. Fast MOST of the time, occasionally
+#                  slow -- like a real service with a GC pause or a cache miss.
+#    · app         the service under test. Calls the dependency once (/api/simple)
+#                  or N times in parallel (/api/fanout?n=100).
+#    · k6          fires load at `app` and reports percentiles.
+#
+#  WHAT YOU LEARN
+#    1. p50 vs p99 on a HEALTHY system (they're already far apart)
+#    2. what a 200ms dependency does to your p99
+#    3. ⭐ TAIL LATENCY AMPLIFICATION -- fan out to 100 backends and a
+#          dependency that's slow 1% of the time makes you slow 63% of the time
+#
+#  ---------------------------------------------------------------------------
+#  HOW TO RUN — in this order
+#  ---------------------------------------------------------------------------
+#
+#    # 1. start the two services (detached, i.e. in the background)
+#    docker compose up -d
+#
+#    # 2. check they're up. `dependency` should say (healthy)
+#    docker compose ps
+#
+#    # 3. sanity check by hand
+#    curl localhost:3000/api/simple
+#    curl "localhost:3000/api/fanout?n=10"
+#
+#    # 4. EXPERIMENT 1 -- baseline percentiles
+#    docker compose run --rm k6 run -e TARGET=/api/simple -e RPS=200 -e DURATION=30s /scripts/load.js
+#
+#    # 5. EXPERIMENT 2 -- inject a 200ms delay, LIVE (no restart needed)
+#    curl -XPOST localhost:4000/admin/config -d '{"baseMs":205,"slowProbability":0}'
+#    docker compose run --rm k6 run -e TARGET=/api/simple -e RPS=200 -e DURATION=20s /scripts/load.js
+#    curl -XPOST localhost:4000/admin/config -d '{"baseMs":5,"slowProbability":0.01}'   # restore
+#
+#    # 6. EXPERIMENT 3 -- the important one. Keep DOWNSTREAM load constant so
+#    #    the only variable is FAN-OUT WIDTH:
+#    docker compose run --rm k6 run -e TARGET=/api/simple         -e RPS=200 -e DURATION=30s /scripts/load.js
+#    docker compose run --rm k6 run -e "TARGET=/api/fanout?n=10"  -e RPS=20  -e DURATION=60s /scripts/load.js
+#    docker compose run --rm k6 run -e "TARGET=/api/fanout?n=100" -e RPS=5   -e DURATION=60s /scripts/load.js
+#
+#    # 7. tidy up
+#    docker compose down
+#
+#  See ./README.md for the expected numbers, and ../../DOCKER-GUIDE.md for
+#  Docker concepts.
+# =============================================================================
+
+# `services:` -- each entry below becomes ONE running container.
+# ⭐ The service NAME (dependency, app, k6) is also its HOSTNAME on the private
+#    network compose creates. That's why app can reach `http://dependency:4000`.
+services:
+
+  # ---------------------------------------------------------------------------
+  # The fake downstream service.
+  # ---------------------------------------------------------------------------
+  dependency:
+    # A prebuilt image from Docker Hub. `alpine` = a tiny Linux base (~50MB).
+    # No Dockerfile needed here: our code has ZERO npm dependencies, so we can
+    # just mount it into the stock Node image.
+    image: node:24-alpine
+
+    container_name: p0-dependency      # fixed name so `docker logs p0-dependency` works
+    working_dir: /srv                  # the directory `command` runs in, inside the container
+
+    volumes:
+      # host path : path inside container : ro = read-only
+      # ⭐ This is a BIND MOUNT: your local ./dependency folder appears at /srv
+      #    inside the container. Edit server.js on your laptop and it's changed
+      #    inside instantly -- then `docker compose restart dependency` to reload.
+      - ./dependency:/srv:ro
+
+    command: node server.js            # what to run (overrides the image's default)
+
+    environment:
+      # These configure the fake service's latency profile. The code reads them
+      # via process.env. They can also be changed at RUNTIME via
+      # POST /admin/config -- which is how experiment 2 works without a restart.
+      PORT: "4000"
+      BASE_MS: "5"              # the FAST path: ~5ms (jittered)
+      SLOW_MS: "200"            # extra ms added on the slow path
+      SLOW_PROBABILITY: "0.01"  # ⭐ 1% of calls take the slow path.
+                                #    This BIMODAL shape is the whole point -- a
+                                #    fixed-latency fake would have no tail, and
+                                #    tail amplification only exists if there's a tail.
+
+    ports:
+      # "HOST:CONTAINER" -- published so YOU can curl the admin endpoint from
+      # your laptop at localhost:4000. `app` doesn't need this; it reaches the
+      # dependency over the internal network as `dependency:4000`.
+      - "4000:4000"
+
+    healthcheck:
+      # How Docker decides this container is "healthy". Other services can then
+      # WAIT for that (see app's depends_on below).
+      # Runs INSIDE the container, so it uses localhost:4000, not 4000 on your laptop.
+      test: ["CMD", "node", "-e", "fetch('http://localhost:4000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 5s     # check every 5s
+      timeout: 3s      # a check taking >3s counts as a failure
+      retries: 5       # 5 consecutive failures -> "unhealthy"
+
+  # ---------------------------------------------------------------------------
+  # The service under test.
+  # ---------------------------------------------------------------------------
+  app:
+    image: node:24-alpine
+    container_name: p0-app
+    working_dir: /srv
+    volumes:
+      - ./app:/srv:ro
+    command: node server.js
+
+    environment:
+      PORT: "3000"
+      # ⭐ NOTE THE HOSTNAME: `dependency`, not localhost or an IP.
+      #    Compose's internal DNS resolves service names to container IPs.
+      DEP_HOST: dependency
+      DEP_PORT: "4000"
+
+      KEEP_ALIVE: "true"     # reuse TCP connections to the dependency.
+                             # Set to "false" for bonus experiment A: every call
+                             # then pays a TCP handshake, which at fan-out 100
+                             # means 100 handshakes per request.
+      MAX_SOCKETS: "1024"    # max concurrent connections to the dependency.
+                             # Set to "10" for bonus experiment B: you build a
+                             # QUEUE INSIDE YOUR OWN PROCESS, and latency explodes
+                             # while the dependency is just as fast as before.
+
+    ports:
+      - "3000:3000"
+
+    depends_on:
+      dependency:
+        # ⭐ `service_healthy` (not just `service_started`) means: don't start
+        #    `app` until `dependency`'s healthcheck actually passes. Without
+        #    this, app can start first and its first requests fail.
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # The load generator. NOT a server -- a one-shot tool.
+  # ---------------------------------------------------------------------------
+  k6:
+    image: grafana/k6:latest
+    container_name: p0-k6
+
+    # ⚠️ IMPORTANT: `profiles` means this service is SKIPPED by `docker compose up`.
+    #    That's deliberate -- you don't want a load test running continuously.
+    #    You start it explicitly, one run at a time:
+    #
+    #        docker compose run --rm k6 run /scripts/load.js
+    #                            ^^^^^ delete the container when it finishes
+    #
+    #    (See DOCKER-GUIDE.md "Gotcha 1" -- this also means `up --build` won't
+    #     rebuild profile'd services.)
+    profiles: ["tools"]
+
+    volumes:
+      - ./k6:/scripts:ro     # your test scripts, readable at /scripts inside
+
+    depends_on:
+      - app

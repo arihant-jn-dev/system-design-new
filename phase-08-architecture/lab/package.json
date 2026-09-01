@@ -1,0 +1,6 @@
+{
+  "name": "phase08-architecture-lab",
+  "private": true,
+  "description": "Multi-tenancy isolation models demonstrated in Postgres.",
+  "dependencies": { "pg": "^8.13.1" }
+}

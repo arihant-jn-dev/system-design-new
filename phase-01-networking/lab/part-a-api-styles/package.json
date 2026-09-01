@@ -1,0 +1,15 @@
+{
+  "name": "phase01-api-styles-lab",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Same endpoint served as REST/JSON, gRPC/protobuf and SSE, so payload size and latency can be compared directly.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "bench": "node client.js"
+  },
+  "dependencies": {
+    "@grpc/grpc-js": "^1.12.5",
+    "@grpc/proto-loader": "^0.7.13"
+  }
+}

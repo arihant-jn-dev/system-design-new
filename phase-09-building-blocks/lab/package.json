@@ -1,0 +1,6 @@
+{
+  "name": "phase09-building-blocks-lab",
+  "private": true,
+  "description": "Bloom filter, Snowflake IDs, top-K autocomplete (no deps) + a Postgres B-tree locality benchmark.",
+  "dependencies": { "pg": "^8.13.1" }
+}

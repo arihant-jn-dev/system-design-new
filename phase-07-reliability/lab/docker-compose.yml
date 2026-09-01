@@ -1,0 +1,182 @@
+# =============================================================================
+#  PHASE 7 LAB — resilience patterns, and a zero-downtime migration
+# =============================================================================
+#
+#  TWO INDEPENDENT PARTS.
+#
+#  PART A — what a SLOW dependency does to you, and what stops it
+#
+#      k6 ──▶ app ──▶ dependency          the dependency slows to 5 SECONDS
+#                                          mid-test. It never returns an error.
+#
+#      Four configurations, one failure:
+#        none              28.4% success, p99 6.41s        ⚠️ the cascade
+#        + timeout         25.7% success, p99  154ms       fast failure
+#        + retry           25.0% success, 7,405 dep calls  ⚠️ RETRIES MADE IT WORSE
+#        + breaker+fallback ⭐ 100% success, 1,655 dep calls ⭐ better for BOTH sides
+#
+#  PART B — rename a column on a live table with writes flowing
+#
+#      postgres <-- migration (an 8-step expand -> migrate -> contract)
+#      Result: 2,742 writes, ZERO errors, zero NULLs, zero mismatches.
+#
+#  ---------------------------------------------------------------------------
+#  HOW TO RUN — in this order
+#  ---------------------------------------------------------------------------
+#
+#    # 1. start the long-running services
+#    docker compose up -d dependency app postgres
+#    docker compose ps
+#    curl localhost:3007/api/thing          # sanity check
+#
+#    # 2. PART A -- all four configurations (~2.5 min)
+#    ./part-a-resilience/run.sh
+#
+#    # watch live while it runs, in another terminal:
+#    watch -n1 'curl -s localhost:3007/stats | python3 -m json.tool'
+#
+#    # 3. PART B -- the migration
+#    docker compose build migration
+#    docker compose run --rm migration node run.js
+#
+#    # 4. try things by hand:
+#    curl -XPOST localhost:3007/admin/mode -d '{"mode":"breaker"}'     # switch pattern
+#    curl -XPOST localhost:4001/admin/config -d '{"baseMs":5000}'      # degrade the dep
+#    curl -XPOST localhost:4001/admin/config -d '{"errorProbability":1}'  # ⭐ ERRORS
+#    #   ...and note errors are MUCH LESS damaging than slowness. That's the
+#    #   whole "slow is worse than down" lesson, and you can feel it here.
+#    curl localhost:3007/stats                                          # breakerState
+#
+#    # 5. clean up
+#    docker compose down -v
+#
+#  See ./README.md for expected numbers.
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # The flaky downstream. Its latency profile is changeable AT RUNTIME, so one
+  # load test can walk it through healthy -> degraded -> recovered.
+  # ---------------------------------------------------------------------------
+  dependency:
+    image: node:24-alpine        # zero npm dependencies -- no Dockerfile needed
+    container_name: p7-dependency
+    working_dir: /srv
+    volumes:
+      - ./part-a-resilience/dependency:/srv:ro
+    command: node server.js
+
+    environment:
+      PORT: "4000"
+      BASE_MS: "20"              # healthy latency
+      P99_MS: "50"               # extra ms on the slow path
+      SLOW_PROBABILITY: "0.01"   # 1% slow when healthy
+
+    ports:
+      - "4001:4000"              # published so you can POST /admin/config
+
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:4000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  # ---------------------------------------------------------------------------
+  # The service under test. Resilience patterns switch on ONE AT A TIME.
+  # ---------------------------------------------------------------------------
+  app:
+    image: node:24-alpine
+    container_name: p7-app
+    working_dir: /srv
+    volumes:
+      - ./part-a-resilience/app:/srv:ro
+    command: node server.js
+
+    environment:
+      PORT: "3000"
+      DEP_URL: http://dependency:4000/work    # ⭐ service name, not localhost
+
+      # ⭐ THE EXPERIMENT SWITCH. run.sh changes this at runtime via
+      #    POST /admin/mode, so no restarts are needed:
+      #      none    -> no timeout, no retry, no breaker (the naive version)
+      #      timeout -> bounded wait
+      #      retry   -> timeout + retry with FULL JITTER
+      #      breaker -> timeout + retry + circuit breaker + fallback
+      MODE: none
+
+      TIMEOUT_MS: "150"          # ⭐ ~3x the healthy p99. THAT is how you pick a
+                                 #    timeout: from the dependency's p99 plus
+                                 #    headroom -- never from a guess.
+      MAX_ATTEMPTS: "3"
+
+      # ⭐ THE BULKHEAD -- the most important number in this file.
+      #    A real service has FINITE capacity, and running out is exactly HOW a
+      #    slow dependency becomes YOUR outage.
+      #    Little's Law: at 200 req/s with a 5s dependency you'd need
+      #    200 x 5 = 1,000 concurrent requests to keep up. You have 50.
+      #    Raise this to 10000 and re-run mode=none to watch the process
+      #    accumulate in-flight requests instead of rejecting them.
+      MAX_CONCURRENCY: "50"
+
+      BREAKER_THRESHOLD: "10"    # consecutive failures before the breaker OPENS.
+                                 # Try 3 -- it trips much sooner.
+      BREAKER_COOLDOWN: "3000"   # ms before HALF-OPEN probes are allowed.
+                                 # Try 10000 -- recovery becomes visibly slower.
+
+    ports:
+      - "3007:3000"
+
+    depends_on:
+      dependency:
+        condition: service_healthy
+
+  k6:
+    image: grafana/k6:latest
+    profiles: ["tools"]
+    volumes:
+      - ./k6:/scripts:ro
+    depends_on:
+      - app
+
+  # ===========================================================================
+  #  PART B — the migration
+  # ===========================================================================
+
+  postgres:
+    image: postgres:17-alpine
+    container_name: p7-postgres
+    environment:
+      POSTGRES_USER: lab
+      POSTGRES_PASSWORD: lab
+      POSTGRES_DB: lab
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "5439:5432"              # ⚠️ 5439 -- the last free port in the lab range
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lab -d lab"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+
+  migration:
+    build: ./part-b-migration
+    container_name: p7-migration
+    profiles: ["tools"]          # ⚠️ build explicitly: docker compose build migration
+
+    environment:
+      PGHOST: postgres
+      PGUSER: lab
+      PGPASSWORD: lab
+      PGDATABASE: lab
+
+    volumes:
+      # ⭐ Mount only the SCRIPT, not the whole directory.
+      #    Mounting ./part-b-migration over /srv would hide the node_modules the
+      #    image installed there -- which is exactly the "Cannot find module 'pg'"
+      #    error I hit while building this lab. See DOCKER-GUIDE.md Gotcha 2.
+      - ./part-b-migration/run.js:/srv/run.js:ro
+
+    depends_on:
+      postgres:
+        condition: service_healthy

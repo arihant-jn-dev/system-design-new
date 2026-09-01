@@ -1,0 +1,199 @@
+# =============================================================================
+#  PHASE 5 LAB — the cold-cache outage, and Redis rate limiters
+# =============================================================================
+#
+#  WHAT THIS BUILDS
+#
+#      k6 ──▶ app ──▶ redis  (hit)
+#                 └──▶ postgres (miss)
+#
+#  WHAT YOU LEARN
+#    A · ⭐ THE COLD-CACHE OUTAGE. Warm the cache (83% hit rate, DB nearly idle),
+#        then FLUSHALL under load: 271 requests FAIL and p95 hits 2 SECONDS --
+#        with nothing broken except an empty cache.
+#        ⭐ Losing a PERFORMANCE component caused an AVAILABILITY failure.
+#        Then turn on request coalescing and run the identical failure: 0 errors.
+#    B · three rate limiters in Redis. A fixed window lets 20 requests through a
+#        10-per-window limit by straddling the boundary; a sorted set holds at
+#        exactly 10; a Lua token bucket bursts then refills.
+#
+#  ---------------------------------------------------------------------------
+#  HOW TO RUN — in this order
+#  ---------------------------------------------------------------------------
+#
+#    # 1. build and start
+#    docker compose up -d --build
+#    docker compose ps
+#
+#    # 2. ⚠️ build the profile'd tools service EXPLICITLY.
+#    #    `up --build` skips it -- see DOCKER-GUIDE.md Gotcha 1.
+#    docker compose build lab
+#
+#    # 3. seed 10k products + 2M reviews (~20s)
+#    docker compose run --rm lab node part-a-cache/seed.js
+#
+#    # 4. PART A -- three load tests: warm, flushed, flushed+coalescing (~3 min)
+#    ./part-a-cache/run.sh
+#
+#    # 5. PART B -- rate limiters (fast)
+#    docker compose run --rm lab node part-b-rate-limiters/run.js
+#
+#    # 6. poke at things yourself:
+#    curl localhost:3005/stats                      # hit rate, DB QPS, coalescing
+#    docker exec -it p5-redis redis-cli
+#    #   DBSIZE                                     -- how many keys
+#    #   INFO stats                                 -- hits/misses/evictions
+#    #   ⚠️ never run KEYS * in production: it's O(N) and BLOCKS the single thread
+#    psql postgresql://lab:lab@localhost:5437/lab
+#
+#    # 7. clean up
+#    docker compose down -v
+#
+#  See ./README.md for expected numbers.
+# =============================================================================
+
+services:
+
+  postgres:
+    image: postgres:17-alpine
+    container_name: p5-postgres
+
+    environment:
+      POSTGRES_USER: lab
+      POSTGRES_PASSWORD: lab
+      POSTGRES_DB: lab
+      POSTGRES_HOST_AUTH_METHOD: trust   # lab only -- no password prompts
+
+    # ⭐ DELIBERATELY UNDER-PROVISIONED, and that IS the experiment.
+    #    The whole lab is about what happens when the cache stops protecting a
+    #    database sized for ~5% of the read traffic. Give this more memory and
+    #    more connections and the outage simply won't reproduce.
+    # ⚠️ `command: >` is a YAML FOLDED SCALAR: everything under it is LITERAL
+    #    TEXT, so `#` there is NOT a comment. Explanations live above the block.
+    #
+    #      shared_buffers=64MB   a small page cache -- part of under-provisioning.
+    #  ⭐  max_connections=60     the app's pool is 20. A 55ms query at 800 req/s
+    #                            would need ~44 concurrent connections just to
+    #                            keep up (Little's Law), so exhausting the pool
+    #                            is HOW the cold-cache outage actually manifests.
+    command: >
+      postgres
+      -c shared_buffers=64MB
+      -c max_connections=60
+
+    ports:
+      - "5437:5432"              # ⚠️ 5437 -- 5432/5433/5434 are already taken
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lab -d lab"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+
+  redis:
+    image: redis:7-alpine
+    container_name: p5-redis
+
+    # ⚠️ Same YAML folded-scalar rule -- no `#` comments inside the block.
+    #
+    #  ⭐  --maxmemory-policy allkeys-lru
+    #        WHAT REDIS DOES WHEN MEMORY IS FULL. Redis' DEFAULT is `noeviction`,
+    #        which makes WRITES FAIL when full -- a real surprise if you assumed
+    #        it behaves like a cache. `allkeys-lru` evicts the least-recently-used
+    #        key instead. (Try `--maxmemory 8mb` and watch evictions climb while
+    #        the hit rate collapses.)
+    #
+    #  ⭐  --appendonly no
+    #        NO PERSISTENCE, so a restart starts EMPTY. That is realistic for a
+    #        pure cache -- and it is exactly the cold-start scenario this lab is
+    #        about. (Enable it and a restart reloads the dataset instead.)
+    command: >
+      redis-server
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --appendonly no
+
+    ports:
+      - "6380:6379"              # ⚠️ 6380 on the host in case you already run
+                                 #    Redis on the default 6379
+
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  # ---------------------------------------------------------------------------
+  # The service under test: a read-through cache in front of Postgres.
+  # ---------------------------------------------------------------------------
+  app:
+    build: .
+    container_name: p5-app
+
+    environment:
+      PGHOST: postgres
+      PGUSER: lab
+      PGPASSWORD: lab
+      PGDATABASE: lab
+      REDIS_HOST: redis
+      PORT: "3000"
+
+      COALESCE: "false"    # ⭐ THE EXPERIMENT'S SWITCH.
+                           #    false -> every concurrent miss for the same key
+                           #             issues its OWN database query
+                           #    true  -> the first miss queries; the rest AWAIT
+                           #             THE SAME PROMISE (singleflight)
+                           #    run.sh flips this at runtime via
+                           #    POST /admin/coalesce, so no restart is needed.
+
+      CACHE_TTL: "60"      # seconds. Try 5 with no jitter and watch keys expire
+                           # together -- that's a cache AVALANCHE you caused.
+
+    ports:
+      - "3005:3000"        # curl localhost:3005/stats
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # One-shot scripts (seeding, rate limiters).
+  # ---------------------------------------------------------------------------
+  lab:
+    build: .                   # same image as `app` -- it already has pg + ioredis
+    container_name: p5-lab
+    profiles: ["tools"]        # ⚠️ `up --build` SKIPS this. Build it explicitly:
+                               #      docker compose build lab
+                               #    (This exact gotcha produced a
+                               #     "Cannot find module 'ioredis'" while building
+                               #     the lab.)
+
+    environment:
+      PGHOST: postgres
+      PGUSER: lab
+      PGPASSWORD: lab
+      PGDATABASE: lab
+      REDIS_HOST: redis
+
+    volumes:
+      # Mount the script SUBDIRECTORIES so you can edit and re-run without
+      # rebuilding. Not /srv itself -- that would hide node_modules
+      # (DOCKER-GUIDE.md Gotcha 2).
+      - ./part-a-cache:/srv/part-a-cache:ro
+      - ./part-b-rate-limiters:/srv/part-b-rate-limiters:ro
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  k6:
+    image: grafana/k6:latest
+    profiles: ["tools"]
+    volumes:
+      - ./k6:/scripts:ro
+    depends_on:
+      - app

@@ -1,0 +1,5 @@
+{
+  "name": "p7-migration",
+  "private": true,
+  "dependencies": { "pg": "^8.13.1" }
+}

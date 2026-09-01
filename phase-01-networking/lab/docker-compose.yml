@@ -1,0 +1,163 @@
+# =============================================================================
+#  PHASE 1 LAB — API styles (REST/gRPC/SSE) and pagination
+# =============================================================================
+#
+#  TWO INDEPENDENT PARTS. Run them in either order.
+#
+#  PART A — the same endpoint served three ways
+#      api-styles ──┬── REST/JSON  on :3000
+#                   ├── SSE        on :3000  (text/event-stream)
+#                   └── gRPC       on :50051 (protobuf over HTTP/2)
+#      bench (a one-shot client) measures BYTES and LATENCY for each.
+#
+#      What you learn: protobuf is ~37% smaller than JSON for the same object --
+#      but the bigger lesson is A2, where delivering 100 updates by POLLING
+#      costs 15x more bytes than SSE, because ~800 bytes of HTTP headers are
+#      re-sent on every single poll.
+#
+#  PART B — offset vs keyset pagination over 1,000,000 rows
+#      postgres + a one-shot `pagination` container running three scripts.
+#
+#      What you learn: OFFSET degrades ~195x by page 45,000 (it SCANS and
+#      DISCARDS every row before the page) -- and, more importantly, it
+#      SILENTLY SKIPS AND DUPLICATES rows when data changes between pages.
+#
+#  ---------------------------------------------------------------------------
+#  HOW TO RUN — in this order
+#  ---------------------------------------------------------------------------
+#
+#    # 0. build images and start the long-running services
+#    docker compose up -d --build
+#    docker compose ps                       # api-styles healthy, postgres healthy
+#
+#    # --- PART A -------------------------------------------------------------
+#    docker compose run --rm bench           # prints both comparison tables
+#
+#    # see SSE on the wire (-N disables curl's buffering so you see it stream):
+#    curl -N "localhost:3000/sse/products/1/price?count=5&interval=500"
+#
+#    # ⭐ SSE's built-in replay -- resume from where you left off:
+#    curl -N -H "Last-Event-ID: 42" "localhost:3000/sse/products/1/price?count=5"
+#
+#    # compare payload sizes for one object:
+#    curl -i localhost:3000/rest/products/1     # look at x-json-bytes vs x-protobuf-bytes
+#
+#    # --- PART B -------------------------------------------------------------
+#    docker compose run --rm pagination node seed.js          # ~3s, 1M rows, 186MB
+#    docker compose run --rm pagination node bench.js         # the performance cliff
+#    docker compose run --rm pagination node correctness.js   # the silent data bug
+#
+#    # poke at the data yourself (note port 5433, not 5432):
+#    psql postgresql://lab:lab@localhost:5433/lab
+#
+#    # 9. clean up  (-v also deletes the 1M-row volume)
+#    docker compose down -v
+#
+#  See ../../DOCKER-GUIDE.md for Docker concepts and the full port map.
+# =============================================================================
+
+services:
+
+  # ===========================================================================
+  #  PART A
+  # ===========================================================================
+
+  # The server: REST + SSE + gRPC, all serving the SAME product object so the
+  # comparison is apples-to-apples.
+  api-styles:
+    # `build:` (not `image:`) -- this one needs npm packages (@grpc/grpc-js),
+    # so there's a Dockerfile in that directory. See it for why the copy order
+    # matters for build caching.
+    build: ./part-a-api-styles
+    container_name: p1-api-styles
+
+    ports:
+      - "3000:3000"      # REST + SSE
+      - "50051:50051"    # gRPC. Different port because gRPC needs HTTP/2 and
+                         # its own server, though it could share one in theory.
+
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # The benchmark client. A one-shot tool, so it's behind a profile.
+  bench:
+    build: ./part-a-api-styles     # same image as the server -- it has the .proto
+                                   # file and the gRPC client library already
+    container_name: p1-bench
+    profiles: ["tools"]            # ⚠️ skipped by `up`; run explicitly (see header)
+
+    environment:
+      # ⭐ Service names as hostnames again. From INSIDE the network it's
+      #    api-styles:3000, not localhost:3000.
+      HTTP_TARGET: http://api-styles:3000
+      GRPC_TARGET: api-styles:50051
+      UPDATES: "100"     # how many updates to deliver in experiment A2.
+                         # Try UPDATES=1000: the polling/SSE gap widens linearly,
+                         # because header overhead is charged PER REQUEST.
+      RUNS: "200"        # samples for the latency percentiles in A1
+
+    command: node client.js
+
+    depends_on:
+      api-styles:
+        condition: service_healthy
+
+  # ===========================================================================
+  #  PART B
+  # ===========================================================================
+
+  postgres:
+    image: postgres:17-alpine
+    container_name: p1-postgres
+
+    environment:
+      # The official Postgres image reads these on FIRST START to create the
+      # user/db. They're ignored afterwards if a data volume already exists.
+      POSTGRES_USER: lab
+      POSTGRES_PASSWORD: lab
+      POSTGRES_DB: lab
+
+    ports:
+      # ⚠️ 5433 on the HOST, not 5432 -- your machine already runs a pgvector
+      #    container on 5432 and Docker would refuse with "port is already
+      #    allocated". Inside the compose network it's still the normal 5432.
+      - "5433:5432"
+
+    # Give Postgres enough memory that we're measuring PAGINATION STRATEGY
+    # rather than disk thrashing. Without this, both approaches look slow for
+    # the wrong reason and the lesson is lost.
+    command: >
+      postgres
+      -c shared_buffers=256MB
+      -c work_mem=16MB
+      -c max_wal_size=2GB
+
+    healthcheck:
+      # pg_isready is Postgres' own readiness probe. Postgres accepts TCP
+      # connections before it can actually serve queries, so "the port is open"
+      # is NOT the same as "ready" -- hence a real probe.
+      test: ["CMD-SHELL", "pg_isready -U lab -d lab"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # The scripts container. No long-running process -- you invoke each script.
+  pagination:
+    build: ./part-b-pagination
+    container_name: p1-pagination
+    profiles: ["tools"]
+
+    environment:
+      PGHOST: postgres      # ⭐ the service name; port 5432 internally
+      PGUSER: lab
+      PGPASSWORD: lab
+      PGDATABASE: lab
+      ROWS: "1000000"       # try ROWS=5000000 and re-run bench.js --
+                            # the OFFSET cliff scales linearly with depth
+
+    depends_on:
+      postgres:
+        condition: service_healthy

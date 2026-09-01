@@ -1,0 +1,186 @@
+# =============================================================================
+#  PHASE 4 LAB — Raft leader election and fencing tokens
+# =============================================================================
+#
+#  WHAT THIS BUILDS
+#
+#      etcd1 ── etcd2 ── etcd3        a 3-node Raft cluster
+#      resource                        the thing a distributed lock protects
+#
+#  ⭐ WHY THREE NODES: Raft needs a MAJORITY to elect a leader and commit.
+#       3 nodes -> majority 2 -> tolerates 1 failure
+#       4 nodes -> majority 3 -> STILL tolerates only 1     ⚠️ strictly worse
+#       5 nodes -> majority 3 -> tolerates 2
+#     Always use an ODD number. An even count adds cost without adding
+#     fault tolerance, and requires MORE nodes to agree on every write.
+#
+#  WHAT YOU LEARN
+#    A · pause the leader (a GC pause, not a crash) and watch a new leader get
+#        elected at a HIGHER TERM -- then watch the old leader step down when
+#        it wakes and sees that term
+#    B · ⭐ why a distributed lock WITHOUT a fencing token is unsafe: a stalled
+#        client's late write DESTROYS the new lock-holder's data
+#
+#  ---------------------------------------------------------------------------
+#  HOW TO RUN — in this order
+#  ---------------------------------------------------------------------------
+#
+#    # 1. start (fast -- etcd boots in seconds, unlike Cassandra)
+#    docker compose up -d
+#    docker compose ps
+#
+#    # 2. see the cluster and who leads. IS LEADER should be true for exactly one.
+#    docker exec p4-etcd1 etcdctl endpoint status --cluster -w table
+#
+#    # 3. EXPERIMENT A -- leader election
+#    ./leader-election.sh
+#
+#    # 4. EXPERIMENT B -- fencing tokens (needs curl; runs the scenario twice)
+#    ./fencing.sh
+#
+#    # 5. ⭐ TRY THIS -- lose the MAJORITY and watch etcd refuse to serve:
+#    docker pause p4-etcd2 p4-etcd3
+#    docker exec p4-etcd1 etcdctl put /demo/x y     # hangs, then fails
+#    docker unpause p4-etcd2 p4-etcd3
+#    #   etcd is CP: with no majority it REFUSES rather than risk divergence.
+#    #   Cassandra at CL=ONE (Phase 3F) would have kept accepting writes.
+#    #   Same partition, opposite choice -- that's why "CP vs AP" is an
+#    #   incomplete way to describe a database.
+#
+#    # 6. clean up
+#    docker compose down -v
+#
+#  See ./README.md for expected output.
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # etcd NODE 1.
+  #
+  # ⭐ `&etcd` is a YAML anchor, but note each node still needs its OWN
+  #    `command:` because the flags contain the node's own name and URLs.
+  #    The anchor mainly shares the image and healthcheck.
+  # ---------------------------------------------------------------------------
+  etcd1: &etcd
+    image: gcr.io/etcd-development/etcd:v3.5.17
+    container_name: p4-etcd1
+
+    # Read these flags -- they're the cluster's whole definition:
+    command: >
+      etcd
+      --name etcd1
+      --data-dir /etcd-data
+
+      --listen-client-urls http://0.0.0.0:2379
+      --advertise-client-urls http://etcd1:2379
+
+      --listen-peer-urls http://0.0.0.0:2380
+      --initial-advertise-peer-urls http://etcd1:2380
+
+      --initial-cluster etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
+      --initial-cluster-token p4-lab
+      --initial-cluster-state new
+
+      --heartbeat-interval 100
+      --election-timeout 1000
+      --logger zap
+      --log-level warn
+    #
+    #  · 2379 = CLIENT port (your requests).  2380 = PEER port (Raft traffic
+    #    between nodes). Two ports because they're completely different
+    #    protocols and you'd firewall them differently.
+    #
+    #  · `--listen-*` = what to bind locally (0.0.0.0 = all interfaces).
+    #    `--advertise-*` = the address to TELL OTHERS to use. They differ
+    #    because a container can't know its own reachable hostname.
+    #
+    #  · `--initial-cluster` lists ALL members up front. This is "static
+    #    bootstrap": every node is told the full membership at birth.
+    #
+    #  · ⭐ `--heartbeat-interval 100` / `--election-timeout 1000`
+    #    THE RAFT TIMING KNOBS, and the reason experiment A takes ~1s not ~45s:
+    #      - the leader sends a heartbeat every 100ms
+    #      - a follower that hears nothing for ~1000ms becomes a CANDIDATE
+    #    The real election timeout is RANDOMISED around this value -- if it
+    #    were fixed, every follower would time out simultaneously, split the
+    #    vote, and possibly never elect anyone.
+    #    (Production defaults are higher; these are tuned for a fast demo.)
+
+    ports:
+      - "2379:2379"     # only node 1's client port is published; etcdctl from
+                        # inside any container can reach the whole cluster
+
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  etcd2:
+    <<: *etcd                       # reuse image + healthcheck...
+    container_name: p4-etcd2
+    command: >                      # ...but the command must name THIS node
+      etcd
+      --name etcd2
+      --data-dir /etcd-data
+      --listen-client-urls http://0.0.0.0:2379
+      --advertise-client-urls http://etcd2:2379
+      --listen-peer-urls http://0.0.0.0:2380
+      --initial-advertise-peer-urls http://etcd2:2380
+      --initial-cluster etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
+      --initial-cluster-token p4-lab
+      --initial-cluster-state new
+      --heartbeat-interval 100
+      --election-timeout 1000
+      --logger zap
+      --log-level warn
+    ports:
+      - "2380:2379"     # ⚠️ 2380 on the HOST maps to 2379 in the container.
+                        # (Host ports must be unique; the container port is the
+                        #  same for all three because they're separate machines
+                        #  as far as etcd is concerned.)
+
+  etcd3:
+    <<: *etcd
+    container_name: p4-etcd3
+    command: >
+      etcd
+      --name etcd3
+      --data-dir /etcd-data
+      --listen-client-urls http://0.0.0.0:2379
+      --advertise-client-urls http://etcd3:2379
+      --listen-peer-urls http://0.0.0.0:2380
+      --initial-advertise-peer-urls http://etcd3:2380
+      --initial-cluster etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
+      --initial-cluster-token p4-lab
+      --initial-cluster-state new
+      --heartbeat-interval 100
+      --election-timeout 1000
+      --logger zap
+      --log-level warn
+    ports:
+      - "2381:2379"
+
+  # ---------------------------------------------------------------------------
+  # ⭐ THE RESOURCE -- the piece most people leave out of their mental model,
+  #    and the entire reason fencing works.
+  #
+  #    A tiny service that stores a value plus the HIGHEST TOKEN it has ever
+  #    accepted, and rejects anything with a lower one.
+  #
+  #    THE RESOURCE ENFORCES THE TOKEN. Not the lock service, not the client.
+  #    That's why a client which wrongly believes it holds the lock can do no
+  #    damage: the thing it writes to refuses to listen to it.
+  # ---------------------------------------------------------------------------
+  resource:
+    image: node:24-alpine        # zero npm dependencies -- no Dockerfile needed
+    container_name: p4-resource
+    working_dir: /srv
+    volumes:
+      - ./resource:/srv:ro
+    command: node server.js
+    environment:
+      PORT: "7000"
+    ports:
+      - "7000:7000"              # published so fencing.sh can curl it from the host

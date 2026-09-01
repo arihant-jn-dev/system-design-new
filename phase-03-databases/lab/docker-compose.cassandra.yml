@@ -1,0 +1,172 @@
+# =============================================================================
+#  PHASE 3F LAB — a 3-node Cassandra cluster
+# =============================================================================
+#
+#  ⚠️ NOT THE DEFAULT COMPOSE FILE. Every command needs -f:
+#         docker compose -f docker-compose.cassandra.yml up -d
+#
+#  ⚠️ THIS IS THE SLOWEST LAB IN THE REPO -- about 3 minutes to start, because
+#     the nodes must join the cluster ONE AT A TIME (see the healthcheck note).
+#     Start it, then go read the notes while it forms.
+#
+#  ---------------------------------------------------------------------------
+#  WHAT THIS BUILDS
+#
+#      cass1 (seed) ── cass2 ── cass3        one ring, RF=3, 16 tokens each
+#
+#  WHAT YOU LEARN
+#    · QUERY-FIRST MODELLING: two queries -> two tables -> the same data stored
+#      twice, on purpose, because there are no joins
+#    · ⭐ Cassandra REFUSES a query that doesn't fit the key ("use ALLOW
+#      FILTERING") -- where Postgres would silently do a sequential scan
+#    · ⭐ with one node down: ONE and QUORUM keep working, ALL FAILS.
+#      That is R + W > N confirmed on real hardware.
+#    · hinted handoff replays the missed writes when the node returns
+#
+#  ---------------------------------------------------------------------------
+#  HOW TO RUN — in this order
+#  ---------------------------------------------------------------------------
+#
+#    # 1. start the cluster and WAIT (~3 min). Nodes join sequentially.
+#    docker compose -f docker-compose.cassandra.yml up -d
+#
+#    # 2. watch it form. You want THREE lines starting "UN" (Up/Normal):
+#    docker exec p3f-cass1 nodetool status
+#    #   UN  172.x.x.2  ...
+#    #   UN  172.x.x.3  ...
+#    #   UN  172.x.x.4  ...
+#    #   (UJ = still Joining.  DN = Down.  Wait for 3x UN before continuing.)
+#
+#    # 3. run the lab (a shell script -- run from lab/, on the HOST)
+#    ./lab-d-cassandra/run.sh
+#
+#    # 4. poke around yourself:
+#    docker exec -it p3f-cass1 cqlsh
+#    #   DESCRIBE KEYSPACES;
+#    #   SELECT * FROM chat.messages_by_conversation WHERE conversation_id='conv-1';
+#    docker exec p3f-cass1 nodetool ring       # token ranges = consistent hashing
+#    docker exec p3f-cass1 nodetool tablestats chat.messages_by_conversation
+#
+#    # 5. clean up (Cassandra uses a lot of disk)
+#    docker compose -f docker-compose.cassandra.yml down -v
+#
+#  See ./lab-d-cassandra/README.md for expected output.
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # NODE 1 -- the SEED node. Others contact it to discover the cluster.
+  #
+  # A seed is only a bootstrap contact point; it is NOT a master. Cassandra is
+  # leaderless -- once joined, every node is equal and any of them can
+  # coordinate a request.
+  # ---------------------------------------------------------------------------
+  cass1:
+    image: cassandra:5.0
+    container_name: p3f-cass1
+
+    # ⭐ `&cenv` is a YAML ANCHOR: cass2/cass3 reuse this exact block with
+    #    `*cenv` rather than repeating it. Plain YAML, not a Docker feature.
+    environment: &cenv
+      CASSANDRA_CLUSTER_NAME: labcluster
+      CASSANDRA_SEEDS: cass1              # all three point at cass1 to bootstrap
+      CASSANDRA_DC: dc1                   # ⭐ datacenter name. The lab's keyspace
+                                          #    uses NetworkTopologyStrategy with
+                                          #    {'dc1': 3}, so these MUST match or
+                                          #    the keyspace creation fails.
+      CASSANDRA_RACK: rack1
+      CASSANDRA_ENDPOINT_SNITCH: GossipingPropertyFileSnitch
+                                          # how nodes learn each other's DC/rack,
+                                          # so replicas land in different failure
+                                          # domains rather than all on one rack
+
+      # ⚠️ TINY HEAPS. Cassandra normally wants 8-31GB; three nodes at 512MB is
+      #    only viable because this is a toy dataset. Never do this in production.
+      MAX_HEAP_SIZE: 512M
+      HEAP_NEWSIZE: 128M
+
+      # Number of virtual nodes (token ranges) this node owns -- consistent
+      # hashing, exactly as implemented in the Phase 2 lab.
+      # ⚠️ Do NOT change this on a node that already has data: Cassandra refuses
+      #    to start if num_tokens differs from the stored value. (I hit this
+      #    while building the lab -- changing 8 -> 16 made cass1 exit on restart,
+      #    which is why the fix required `down -v` and a fresh cluster.)
+      CASSANDRA_NUM_TOKENS: "16"
+
+    ports:
+      - "9042:9042"     # CQL. Only node 1 is published; that's enough, because
+                        # cqlsh against any node can reach the whole cluster.
+
+    healthcheck:
+      # ⭐⭐ THE MOST IMPORTANT LINE IN THIS FILE, and it took a failure to get right.
+      #
+      #    The obvious check -- `nodetool status | grep '^UN'` -- is WRONG.
+      #    A node that is still JOINING can see its SEED as UN, so it reports
+      #    ITSELF healthy while still bootstrapping. Compose then starts the
+      #    next node, two nodes bootstrap CONCURRENTLY, and you get:
+      #
+      #        RuntimeException: Bootstrap Token collision between /x and /y
+      #
+      #    `nodetool netstats | grep 'Mode: NORMAL'` is PER-NODE and only true
+      #    once THIS node has finished joining. That is what serialises the
+      #    bootstrap and makes `depends_on: service_healthy` actually work.
+      test: ["CMD-SHELL", "nodetool netstats | grep -q 'Mode: NORMAL' && nodetool info | grep -q 'Native Transport active: true'"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 60s    # ⭐ grace period: failures in the first 60s don't
+                           # count. Cassandra's JVM startup is slow.
+
+  # ---------------------------------------------------------------------------
+  # NODE 2 -- does not start joining until node 1 is fully NORMAL.
+  # ---------------------------------------------------------------------------
+  cass2:
+    image: cassandra:5.0
+    container_name: p3f-cass2
+    environment: *cenv                 # reuse the anchor from cass1
+    depends_on:
+      cass1:
+        condition: service_healthy     # ⭐ this is what serialises the joins
+    healthcheck:
+      test: ["CMD-SHELL", "nodetool netstats | grep -q 'Mode: NORMAL' && nodetool info | grep -q 'Native Transport active: true'"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 60s
+
+  # ---------------------------------------------------------------------------
+  # NODE 3 -- waits for node 2. Hence the ~3 minute total startup.
+  # ---------------------------------------------------------------------------
+  cass3:
+    image: cassandra:5.0
+    container_name: p3f-cass3
+    environment: *cenv
+    depends_on:
+      cass2:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "nodetool netstats | grep -q 'Mode: NORMAL' && nodetool info | grep -q 'Native Transport active: true'"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 60s
+
+  # ---------------------------------------------------------------------------
+  # Optional Node container.
+  #
+  # The lab itself is a SHELL script driving `docker exec ... cqlsh`, so you
+  # don't need this to run it. It's here if you'd rather write experiments in
+  # JavaScript with a real Cassandra driver.
+  # ---------------------------------------------------------------------------
+  lab:
+    build: .
+    container_name: p3f-lab
+    profiles: ["tools"]        # ⚠️ not started by `up` -- see DOCKER-GUIDE.md
+    environment:
+      CASSANDRA_CONTACT: cass1
+    volumes:
+      - ./lab-d-cassandra:/srv/lab-d-cassandra:ro
+    depends_on:
+      cass3:
+        condition: service_healthy

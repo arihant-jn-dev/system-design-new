@@ -1,0 +1,42 @@
+syntax = "proto3";
+
+package productlab;
+
+// The SAME logical payload the REST endpoint returns as JSON.
+// Field numbers (= 1, = 2 ...) are what go on the wire, not the names —
+// which is exactly why protobuf is smaller than JSON, and why renaming a
+// field is a compatible change while renumbering one is catastrophic.
+message Product {
+  int64  id            = 1;
+  string name          = 2;
+  string description   = 3;
+  int64  price_cents   = 4;
+  string currency      = 5;
+  int32  stock         = 6;
+  bool   active        = 7;
+  string category      = 8;
+  double rating        = 9;
+  int32  review_count  = 10;
+  string updated_at    = 11;
+}
+
+message GetProductRequest {
+  int64 id = 1;
+}
+
+// Server-streaming: the gRPC equivalent of SSE.
+message PriceUpdate {
+  int64 id          = 1;
+  int64 price_cents = 2;
+  int32 seq         = 3;
+}
+
+message WatchRequest {
+  int64 id    = 1;
+  int32 count = 2;
+}
+
+service ProductService {
+  rpc GetProduct (GetProductRequest) returns (Product);
+  rpc WatchPrice (WatchRequest) returns (stream PriceUpdate);
+}

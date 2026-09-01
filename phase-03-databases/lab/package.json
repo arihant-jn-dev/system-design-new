@@ -1,0 +1,9 @@
+{
+  "name": "phase03-db-labs",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Phase 3A/3B labs: indexing strategies and transaction isolation anomalies.",
+  "dependencies": {
+    "pg": "^8.13.1"
+  }
+}

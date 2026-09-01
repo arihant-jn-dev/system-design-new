@@ -1,0 +1,191 @@
+# =============================================================================
+#  PHASE 3C LAB — replication lag, and failover data loss
+# =============================================================================
+#
+#  ⚠️ THIS IS NOT THE DEFAULT COMPOSE FILE. Every command needs -f:
+#         docker compose -f docker-compose.replication.yml up -d
+#
+#  ---------------------------------------------------------------------------
+#  WHAT THIS BUILDS
+#
+#      primary (5435) ══ streaming replication ══▶ replica (5436)
+#
+#    A REAL Postgres streaming setup, built the way you'd build one in
+#    production -- pg_basebackup + a replication slot -- not a simulation.
+#
+#  WHAT YOU LEARN
+#    · baseline propagation is SUB-MILLISECOND, which is exactly why lag bugs
+#      hide in development
+#    · ⭐ 95.5% of immediate reads from the replica MISS the user's own write
+#    · lag under load: 0.365s / 12.9MB behind -- a 400x swing from idle
+#    · ⭐ failover with a lagging replica LOSES 10,862 ACKNOWLEDGED COMMITS (71%)
+#    · ...and then BOTH nodes report they are the primary. Live split brain.
+#
+#  ---------------------------------------------------------------------------
+#  HOW TO RUN — in this order
+#  ---------------------------------------------------------------------------
+#
+#    # 1. start both nodes. The replica CLONES the primary on first boot, so
+#    #    give it ~30s.
+#    docker compose -f docker-compose.replication.yml up -d
+#    sleep 30
+#    docker compose -f docker-compose.replication.yml ps
+#
+#    # 2. VERIFY replication is actually streaming before trusting any result:
+#    docker exec p3c-primary psql -U lab -d lab \
+#      -c "SELECT application_name, state, sync_state FROM pg_stat_replication;"
+#    docker exec p3c-replica psql -U lab -d lab -tAc "SELECT pg_is_in_recovery();"
+#    #   -> should print: t     (t = "in recovery" = it IS a standby)
+#
+#    # 3. experiments C1-C4 (lag, read-your-writes, sync vs async)
+#    docker compose -f docker-compose.replication.yml run --rm lab node lab-c-replication/lag.js
+#
+#    # 4. FAILOVER -- run from the HOST, not in a container: the script needs
+#    #    to stop and start containers itself.
+#    npm install pg                      # once, anywhere
+#    node lab-c-replication/failover.js
+#
+#    # 5. reset to a clean state (the failover leaves a promoted replica)
+#    docker compose -f docker-compose.replication.yml down -v
+#    docker compose -f docker-compose.replication.yml up -d
+#
+#  See ./lab-c-replication/README.md for expected numbers.
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # THE PRIMARY -- accepts all writes.
+  # ---------------------------------------------------------------------------
+  primary:
+    image: postgres:17-alpine
+    container_name: p3c-primary
+
+    environment:
+      POSTGRES_USER: lab
+      POSTGRES_PASSWORD: lab
+      POSTGRES_DB: lab
+      PGDATA: /var/lib/postgresql/data/pgdata   # a SUBDIRECTORY of the volume.
+                                                # Postgres refuses to initialise
+                                                # into a non-empty dir, and Docker
+                                                # volumes have a lost+found.
+
+      # ⭐ A REAL GOTCHA WORTH UNDERSTANDING.
+      #    pg_hba.conf (Postgres' access rules) is FIRST-MATCH-WINS. The official
+      #    image's entrypoint appends:
+      #        host all all all scram-sha-256
+      #    ...so anything our init script appends AFTER that is SHADOWED and
+      #    never consulted. Setting this makes the entrypoint write `trust`
+      #    instead. (Lab only -- never do this anywhere real.)
+      POSTGRES_HOST_AUTH_METHOD: trust
+
+    volumes:
+      - primary-data:/var/lib/postgresql/data
+
+      # ⭐ Anything in /docker-entrypoint-initdb.d/ runs ONCE, on first
+      #    initialisation only. Ours creates the replication role and adds the
+      #    pg_hba line that lets the replica connect.
+      #
+      #    ⚠️ It will NOT re-run if the volume already exists. If you change it,
+      #       you must `down -v` first.
+      - ./lab-c-replication/init-primary.sh:/docker-entrypoint-initdb.d/10-init.sh:ro
+
+    # ⚠️ `command: >` is a YAML FOLDED SCALAR -- everything under it is LITERAL
+    #    TEXT, so a `#` there is NOT a comment (Docker would fail with "invalid
+    #    command line string"). Explanations therefore live here:
+    #
+    #  ⭐  wal_level=replica         write enough detail to the WAL that a replica
+    #                               can replay it. The default is fine for crash
+    #                               recovery but NOT for replication.
+    #                               (`logical` -- even more detail -- is what
+    #                                CDC/Debezium needs.)
+    #      max_wal_senders=10       how many replicas may stream at once.
+    #      max_replication_slots=10 slots RETAIN WAL for a NAMED replica so it
+    #                               can't fall irrecoverably behind.
+    #                          ⚠️   The flip side: a slot for a replica that never
+    #                               comes back retains WAL FOREVER and fills the
+    #                               primary's disk -- a genuinely common outage.
+    #      wal_keep_size=256MB      extra WAL kept even without a slot.
+    #      hot_standby=on           lets the replica serve READS while replaying.
+    #      synchronous_commit=on    fsync locally before acking. Experiment C4
+    #                               changes this at runtime to price the
+    #                               durability/latency trade.
+    command: >
+      postgres
+      -c wal_level=replica
+      -c max_wal_senders=10
+      -c max_replication_slots=10
+      -c wal_keep_size=256MB
+      -c hot_standby=on
+      -c synchronous_commit=on
+      -c shared_buffers=256MB
+
+    ports:
+      - "5435:5432"
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lab -d lab"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # ---------------------------------------------------------------------------
+  # THE REPLICA -- read-only, continuously replaying the primary's WAL.
+  # ---------------------------------------------------------------------------
+  replica:
+    image: postgres:17-alpine
+    container_name: p3c-replica
+
+    # Run as the postgres user so the data directory has the right ownership
+    # (Postgres refuses to start on a world-readable data dir).
+    user: postgres
+
+    environment:
+      PGDATA: /var/lib/postgresql/data/pgdata
+      PGUSER: lab
+
+    volumes:
+      - replica-data:/var/lib/postgresql/data
+      - ./lab-c-replication/replica-entrypoint.sh:/replica-entrypoint.sh:ro
+
+    # ⭐ We REPLACE the image's entrypoint entirely, because a replica isn't
+    #    created by initdb -- it's CLONED from the primary. Read that script:
+    #    it runs pg_basebackup, which is the real procedure (snapshot + the
+    #    exact log position, so the clone and the live stream splice together).
+    entrypoint: ["/bin/sh", "/replica-entrypoint.sh"]
+
+    ports:
+      - "5436:5432"
+
+    depends_on:
+      primary:
+        condition: service_healthy    # must be up AND initialised before we clone
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lab -d lab"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  lab:
+    build: .
+    container_name: p3c-lab
+    profiles: ["tools"]
+    environment:
+      PRIMARY_HOST: primary
+      REPLICA_HOST: replica
+      PGUSER: lab
+      PGPASSWORD: lab
+      PGDATABASE: lab
+    volumes:
+      - ./lab-c-replication:/srv/lab-c-replication:ro
+    depends_on:
+      replica:
+        condition: service_healthy
+
+# ⭐ NAMED VOLUMES -- Docker-managed storage that OUTLIVES the containers.
+#    That's what makes `docker compose restart` keep your data.
+#    `docker compose down -v` is what deletes them.
+volumes:
+  primary-data:
+  replica-data:

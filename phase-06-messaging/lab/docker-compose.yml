@@ -1,0 +1,164 @@
+# =============================================================================
+#  PHASE 6 LAB — Kafka partitions, duplicate delivery, and the outbox pattern
+# =============================================================================
+#
+#  WHAT THIS BUILDS
+#
+#      kafka (KRaft, no ZooKeeper)  +  postgres  <-- lab (one-shot scripts)
+#
+#  ⭐ ONE BROKER IS ENOUGH for everything the roadmap asks for: partitions,
+#     consumer groups, rebalancing, duplicate delivery, idempotent consumers
+#     and the outbox. (ISR and unclean leader election would need 3 brokers --
+#     those are covered in the notes instead.)
+#
+#  WHAT YOU LEARN
+#    A · keys decide partitions, and partitions decide ORDERING. Then scale a
+#        consumer group 1 -> 4 and watch the 4th consumer sit ⭐ IDLE, because
+#        partition count is a HARD CEILING on parallelism.
+#    B · ⭐ crash a consumer after processing but before committing offsets:
+#        5 payments charged TWICE, customer billed 1500 instead of 1000.
+#        Then the identical crash with a dedupe row in the same transaction:
+#        every payment charged exactly once.
+#    C · ⭐ dual-write with an unreachable broker loses 4 of 10 events SILENTLY.
+#        The outbox version loses ZERO -- with the broker down the whole time.
+#
+#  ---------------------------------------------------------------------------
+#  HOW TO RUN — in this order
+#  ---------------------------------------------------------------------------
+#
+#    # 1. start Kafka + Postgres (~40s; Kafka has a start_period)
+#    docker compose up -d --build
+#    docker compose ps                      # wait for kafka (healthy)
+#
+#    # 2. ⚠️ build the tools image EXPLICITLY (profile'd services are skipped)
+#    docker compose build lab
+#
+#    # 3. the three experiments
+#    docker compose run --rm lab node part-a-partitions/run.js     # ~60s
+#    docker compose run --rm lab node part-b-duplicates/run.js     # ~40s
+#    docker compose run --rm lab node part-c-outbox/run.js         # ~30s
+#
+#    # 4. poke at Kafka with its own CLI (it ships inside the image):
+#    docker exec p6-kafka /opt/kafka/bin/kafka-topics.sh \
+#        --bootstrap-server localhost:9092 --list
+#    docker exec p6-kafka /opt/kafka/bin/kafka-topics.sh \
+#        --bootstrap-server localhost:9092 --describe --topic orders
+#    docker exec p6-kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+#        --bootstrap-server localhost:9092 --describe --group billing   # ⭐ LAG
+#
+#    # 5. clean up
+#    docker compose down -v
+#
+#  ℹ️ You'll see a `TimeoutNegativeWarning` from the kafkajs client. It's a
+#     benign client-side warning, not a broker problem.
+#
+#  See ./README.md for expected numbers.
+# =============================================================================
+
+services:
+
+  kafka:
+    image: apache/kafka:3.9.0
+    container_name: p6-kafka
+
+    environment:
+      # ---- KRaft: Kafka WITHOUT ZooKeeper -----------------------------------
+      # ⭐ Historically Kafka needed a separate ZooKeeper cluster to store
+      #    metadata. KRaft replaces it with an internal RAFT quorum (Phase 4!),
+      #    so one process is both the data broker AND the controller.
+      #    Kafka 4.0 removed ZooKeeper entirely -- if you see a tutorial with a
+      #    `zookeeper:` service, it's dated.
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: broker,controller     # this one process does both
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+
+      # ---- Listeners: WHY THERE ARE THREE -----------------------------------
+      # This is the single most confusing part of any Kafka compose file.
+      #
+      #   PLAINTEXT  :9092   for OTHER CONTAINERS   -> advertised as kafka:9092
+      #   CONTROLLER :9093   for KRaft internals    -> never used by clients
+      #   EXTERNAL   :29092  for YOUR LAPTOP        -> advertised as localhost:29092
+      #
+      # ⭐ Kafka clients connect once, then are TOLD which address to use for
+      #    subsequent requests -- that's `advertised.listeners`. If a container
+      #    were told "localhost:29092" it would try to connect to itself and
+      #    fail. Hence two listeners with two different advertised addresses.
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+
+      # ---- Single-broker settings -------------------------------------------
+      # ⚠️ Kafka's internal topics default to replication factor 3. With one
+      #    broker that's impossible, and the broker refuses to start. These
+      #    must all be 1 for a single-node setup.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+
+      # ⭐ Default is 3000ms: Kafka WAITS that long for more consumers to join
+      #    before rebalancing, to avoid rebalancing once per consumer during a
+      #    rolling start. 0 makes the lab's rebalances immediate and observable.
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+
+      # ⭐ Force topics to be created EXPLICITLY, with a chosen partition count.
+      #    With auto-creation on, a typo in a topic name silently creates a new
+      #    1-partition topic and the ordering/parallelism lesson evaporates.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+
+      CLUSTER_ID: p6labclusterid00000000
+
+    ports:
+      - "29092:29092"    # the EXTERNAL listener, for tools on your laptop
+
+    healthcheck:
+      # Asking Kafka to list topics is a real readiness check -- the port opens
+      # well before the broker can serve metadata.
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+      start_period: 20s    # ⭐ JVM startup grace period; failures here don't count
+
+  postgres:
+    # Used by Part B (the dedupe table) and Part C (orders + outbox).
+    image: postgres:17-alpine
+    container_name: p6-postgres
+    environment:
+      POSTGRES_USER: lab
+      POSTGRES_PASSWORD: lab
+      POSTGRES_DB: lab
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "5438:5432"        # ⚠️ 5438 -- every phase gets its own host port
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lab -d lab"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+
+  lab:
+    build: .
+    container_name: p6-lab
+    profiles: ["tools"]    # ⚠️ build explicitly: docker compose build lab
+
+    environment:
+      KAFKA_BROKER: kafka:9092    # ⭐ the INTERNAL listener -- we're a container,
+                                  #    so we use the service name, not localhost
+      PGHOST: postgres
+      PGUSER: lab
+      PGPASSWORD: lab
+      PGDATABASE: lab
+
+    volumes:
+      # Subdirectories only -- mounting /srv would hide node_modules
+      - ./part-a-partitions:/srv/part-a-partitions:ro
+      - ./part-b-duplicates:/srv/part-b-duplicates:ro
+      - ./part-c-outbox:/srv/part-c-outbox:ro
+
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy

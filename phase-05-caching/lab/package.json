@@ -1,0 +1,10 @@
+{
+  "name": "phase05-caching-lab",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Read-through cache, cold-cache outage, request coalescing, and Redis rate limiters.",
+  "dependencies": {
+    "pg": "^8.13.1",
+    "ioredis": "^5.4.1"
+  }
+}

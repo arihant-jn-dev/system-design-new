@@ -1,0 +1,105 @@
+# =============================================================================
+#  PHASE 8 LAB — architecture patterns
+# =============================================================================
+#
+#  ⚠️ THIS PHASE'S MAIN LAB IS A WRITING EXERCISE, NOT CODE.
+#
+#     The roadmap is explicit: "Take one service you know well. Write a one-page
+#     decomposition... Then write the counter-argument for keeping it a
+#     monolith. Being able to argue BOTH SIDES is the actual skill."
+#
+#     -> That worksheet is ./decomposition/WORKSHEET.md. Do it. It is the phase.
+#
+#  This compose file exists for a SECOND, smaller lab: multi-tenancy isolation,
+#  which is gate Q3 and is much more convincing when you watch it happen.
+#
+#  ---------------------------------------------------------------------------
+#  WHAT THIS BUILDS
+#
+#      postgres  <-- lab (a one-shot script)
+#
+#  WHAT YOU LEARN
+#    · ⭐ SHARED SCHEMA: one forgotten `WHERE tenant_id = ...` and Acme reads
+#      Globex's 50,000 secret deal. One line of code. That is THE multi-tenancy
+#      failure mode.
+#    · ⭐ ROW-LEVEL SECURITY: the SAME buggy query, now safe -- because Postgres
+#      adds the predicate itself. A constraint the system enforces, rather than
+#      a convention your team must follow perfectly forever.
+#    · SCHEMA PER TENANT: isolation by construction... and N migrations.
+#    · ⭐ NOISY NEIGHBOUR: one whale tenant makes a minnow's queries ~100x
+#      slower, until tenant_id leads every index.
+#
+#  ---------------------------------------------------------------------------
+#  HOW TO RUN — in this order
+#  ---------------------------------------------------------------------------
+#
+#    # 1. start Postgres
+#    docker compose up -d
+#    docker compose ps                    # wait for (healthy)
+#
+#    # 2. ⚠️ build the tools image explicitly (profile'd services are skipped
+#    #    by `up --build` -- see ../../DOCKER-GUIDE.md Gotcha 1)
+#    docker compose build lab
+#
+#    # 3. run the multi-tenancy demo (~20s)
+#    docker compose run --rm lab node multi-tenancy/run.js
+#
+#    # 4. poke at it yourself (note port 5440):
+#    psql postgresql://lab:lab@localhost:5440/lab
+#    #   \dn                              -- the per-tenant schemas
+#    #   \d invoices                       -- the shared table
+#    #   SELECT * FROM pg_policies;        -- ⭐ the RLS policy itself
+#
+#    # 5. ⭐ THE MAIN EXERCISE (no Docker needed):
+#    #    open ./decomposition/WORKSHEET.md and fill it in
+#
+#    # 6. clean up
+#    docker compose down -v
+#
+#  See ./README.md for expected output.
+# =============================================================================
+
+services:
+
+  postgres:
+    image: postgres:17-alpine
+    container_name: p8-postgres
+
+    environment:
+      POSTGRES_USER: lab
+      POSTGRES_PASSWORD: lab
+      POSTGRES_DB: lab
+      POSTGRES_HOST_AUTH_METHOD: trust    # lab only -- the demo creates a second
+                                          # role (app_user) to show RLS from a
+                                          # NON-owner connection, and trust keeps
+                                          # that simple
+
+    ports:
+      - "5440:5432"     # ⚠️ 5440 -- every phase gets its own host port so labs
+                        #    can run side by side (5432 is your pgvector container)
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lab -d lab"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+
+  lab:
+    build: .
+    container_name: p8-lab
+    profiles: ["tools"]      # ⚠️ build explicitly: docker compose build lab
+
+    environment:
+      PGHOST: postgres
+      PGUSER: lab
+      PGPASSWORD: lab
+      PGDATABASE: lab
+
+    volumes:
+      # Subdirectory only -- mounting /srv would hide node_modules
+      # (DOCKER-GUIDE.md Gotcha 2)
+      - ./multi-tenancy:/srv/multi-tenancy:ro
+
+    depends_on:
+      postgres:
+        condition: service_healthy

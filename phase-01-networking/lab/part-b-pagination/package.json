@@ -1,0 +1,14 @@
+{
+  "name": "phase01-pagination-lab",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Offset vs keyset pagination over 1M rows: the performance cliff and the correctness bug.",
+  "scripts": {
+    "seed": "node seed.js",
+    "bench": "node bench.js",
+    "correctness": "node correctness.js"
+  },
+  "dependencies": {
+    "pg": "^8.13.1"
+  }
+}
