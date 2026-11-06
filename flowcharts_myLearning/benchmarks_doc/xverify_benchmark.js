@@ -8,7 +8,7 @@ const https = require('https');
 const { URL } = require('url');
 
 // ─── CONFIG ──────────────────────────────────────────────────────────────────
-const API_KEY  = '1017260-A71793CB';
+const API_KEY  = 'YOUR_XVERIFY_API_KEY_HERE';  // Replace with your actual API key
 const DOMAIN   = 'freesamplesprousa.com';
 const BASE_URL = 'https://usapi.xverify.com/v2/ev/';
 const CONCURRENCY = 10;   // parallel requests at a time
